@@ -1,0 +1,7 @@
+# Python dependencies for the sf3-hd pipeline.
+#   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+#
+# Pillow does all image work: page assembly, cutting, quantisation and the
+# alpha handling around the upscaler. Everything else the tools need (zlib,
+# struct, json, unittest) is in the standard library.
+Pillow>=10.0

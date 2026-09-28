@@ -1,0 +1,87 @@
+All-character HD test build — current runbook (2026-09-09)
+
+Run from /mnt/evo2-data/temp-projects/sf3-hd:
+
+./work/hd-test/run.sh
+./work/hd-test/run.sh --stock   # original character pixels, same HD stages
+
+Rebuild the complete local test bundle:
+python3 tools/build_hd_test.py
+
+This reuses all 21 existing stage/bonus repacks, regenerates outdated-scale character
+frames, creates all 20 HD sidecars, rebuilds/verifies the archive into the bundle
+profile, and builds/installs 3SX. The isolated profile is work/hd-test/user-data;
+the installed archive is not replaced. All generated assets and the bundle stay
+local-only under work/.
+
+After changing stage art:
+python3 tools/export_for_upscale.py
+python3 tools/upscale.py
+python3 tools/cut_pages.py
+python3 tools/check_upscaled.py
+python3 tools/ppg_repack.py SF33RD.AFS --mode direct32
+python3 tools/roundtrip_check.py SF33RD.AFS work/repacked/stage10.ppg stage10 --ref work/tiles/stage10
+python3 tools/roundtrip_check.py SF33RD.AFS work/repacked/stage07.ppg stage07 --ref work/tiles/stage07
+python3 tools/build_hd_test.py
+
+The builder always verifies every rebuilt archive entry. It does not regenerate
+stage repacks: run the stage steps above when their source art changes. work/tiles
+currently holds only the character folders, so a stage round-trip check needs its
+chunks cut again first. Use a separate output directory for different-scale
+experiments instead of mixing replacement files.
+
+Character-only refresh: run tools/upscale.py and tools/cut_pages.py for the 20 stems,
+then pack each with cg_hd_pack.py --cg plNN.bin --out work/hd-cg/plNN.hdcg.
+--cg is required on cg_decode_all.py, cg_hd_pack.py and cg_hd_verify.py; the
+accepted values are the TEXGROUP keys in tools/cg_decode_tile.py.
+
+4x is the default for both stages and characters. All 20 source character groups
+(pl00–pl14 and pl16–pl20; no pl15) are extracted, upscaled and packed: 24,760
+frames into 219,943 tiles, 2.41 GiB of sidecars. cg_repack.py remains the old 1x
+AFS route. THREESX_HD_CG names a directory and the engine loads one plNN.hdcg per
+group. See docs/hd-test-build.md for palette/shared-tile limits and validation
+evidence.
+
+Regenerate the distributable engine patch after any 3sx edit:
+  (cd 3sx && git diff HEAD) >> patches/3sx-hd-textures.patch   # keep the header
+Verify it applies to a clean tree:
+  git -C 3sx worktree add --detach /tmp/v 513380f9 && \
+    git -C /tmp/v apply --check ../../patches/3sx-hd-textures.patch
+
+The engine edits are in a separate, gitignored 3sx repository. Preserve its
+changes too: memory pools (512 MiB master / 384 MiB texture), 32 MiB PPG decode
+buffer, GS alpha fix, 4x canvas, and HD character atlas/loader changes.
+The decode buffer must hold one whole decompressed chunk: a 512x512 UI screen
+chunk at 4x needs 16 MiB, well past the 4 MiB a stage chunk ever needs.
+build_screens.py checks this before repacking and refuses if it will not fit.
+
+Next asset targets: menus, timer, health bars, VS screen, loading screen and
+character select portraits. See docs/ui-asset-survey.md.
+
+UI/menu screens (decoding, not yet upscaled or repacked):
+python3 tools/decode_screens.py SF33RD.AFS          # -> work/decoded/<stem>/chunk_NN.png
+python3 tools/verify_screens.py SF33RD.AFS          # independent re-derivation
+python3 -m unittest discover -s tests -p 'test_screens.py'
+
+Upscale and repack the screens (this is the one to run):
+python3 tools/build_screens.py SF33RD.AFS --dry-run   # plan + projected sizes
+python3 tools/build_screens.py SF33RD.AFS             # decode, upscale 4x, repack
+python3 tools/build_hd_test.py                        # bundle: picks them up automatically
+
+build_screens.py ends with one .ppg per screen in work/repacked/, alongside the
+stage repacks, and build_hd_test.py rebuilds the archive from that whole folder.
+No engine change: these entries are loaded by AFS index. --only Select,TitleTM
+limits it; --skip-upscale reuses work/upscaled; --scale 1 round-trips at 1x.
+Expect roughly 225 MiB of 32-bit texels at 4x before zlib, far less packed.
+
+Contact sheets for identifying each screen: work/screens-preview/<stem>.png.
+16-bit PPG data is big-endian unless pixel&4 / c_mode&4 says otherwise; missing
+that swap breaks colours without breaking a round-trip check.
+python3 tools/check_upscaled.py --root work/decoded Select Win TitleTM
+
+14 of 16 screens decode, but only 9 can be REPLACED: Rank1/2, Select, Win/Win1-3,
+TitleTM, Title_R. scrscrn (the in-game HUD), Warning, Warninge, CapLogo and
+Ake3rd carry palettes and the engine picks a bank per draw call, so direct32
+would bake one palette in; build_screens.py refuses them. SelectNew.ppg and Opening.ppg are
+blocked on a ColorRAM palette whose source file is not yet identified. These
+entries are loaded by AFS index, so repacking them needs no engine change.

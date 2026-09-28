@@ -1,0 +1,750 @@
+diff --git a/src/main.c b/src/main.c
+index 784dbdc5..e17183c4 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -78,6 +78,16 @@ Language Get_Default_Language() {
+     return language;
+ }
+ 
++#ifndef HD_PPG_DECBUF
++// 32 MB (stock 0x60000 = 384 KB). ppgSetupTexChunk_3rd pulls one whole
++// decompressed chunk from here: height * pitch bytes. The largest replacement
++// is a 512x512 UI screen chunk at 4x in PSMCT32 -- 2048 * (2048*4) = 16 MB --
++// so 8 MB aborted with "Failed to allocate texture data buffer" as soon as
++// Warning.ppg loaded. Stage chunks only ever reach 4 MB, which is why stages
++// alone were fine.
++#define HD_PPG_DECBUF 0x2000000
++#endif
++
+ static void njUserInit() {
+     s32 i;
+     u32 size;
+@@ -87,7 +97,9 @@ static void njUserInit() {
+     mmSystemInitialize();
+     flGetFrame(&mpp_w.fmsFrame);
+     seqsInitialize(mppMalloc(seqsGetUseMemorySize()));
+-    ppg_Initialize(mppMalloc(0x60000), 0x60000);
++    // HD PROTOTYPE: per-chunk decompression buffer. Stock 0x60000 (384 KB) holds a
++    // 128x128 8bpp chunk; a 512x512 32bpp chunk needs 1 MB, stage07's Akane 4 MB.
++    ppg_Initialize(mppMalloc(HD_PPG_DECBUF), HD_PPG_DECBUF);
+     zlib_Initialize(mppMalloc(0x10000), 0x10000);
+     size = flGetSpace();
+     mpp_w.ramcntBuff = mppMalloc(size);
+diff --git a/src/platform/video/opengl/opengl_renderer.c b/src/platform/video/opengl/opengl_renderer.c
+index 612eab94..1b4c9faf 100644
+--- a/src/platform/video/opengl/opengl_renderer.c
++++ b/src/platform/video/opengl/opengl_renderer.c
+@@ -229,6 +229,14 @@ static void quad_infer_tex_coords(GLQuad* quad) {
+     quad->tex_coords[2].t = quad->tex_coords[3].t;
+ }
+ 
++// HD PROTOTYPE: see sdl_gpu_renderer.c. Geometry is in logical 384x224 units and
++// mapped to NDC by the projection, so only the canvas and viewport scale.
++#ifndef CANVAS_SCALE
++#define CANVAS_SCALE 4
++#endif
++#define CANVAS_W (384 * CANVAS_SCALE)
++#define CANVAS_H (224 * CANVAS_SCALE)
++
+ static void OpenGLRenderer_CreateTexture(unsigned int th) {
+     const int texture_index = LO_16_BITS(th) - 1;
+     const FLTexture* fl_texture = &flTexture[texture_index];
+@@ -499,13 +507,13 @@ static SDL_Window* OpenGLRenderer_Init(const SDLRenderBackendInitInfo* init_info
+     glBindTexture(GL_TEXTURE_2D, canvas_color_tex);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 384, 224, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CANVAS_W, CANVAS_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+ 
+     glGenTextures(1, &canvas_depth_tex);
+     glBindTexture(GL_TEXTURE_2D, canvas_depth_tex);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, 384, 224, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, CANVAS_W, CANVAS_H, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+ 
+     glGenFramebuffers(1, &canvas_fbo);
+     glBindFramebuffer(GL_FRAMEBUFFER, canvas_fbo);
+@@ -632,7 +640,7 @@ static void OpenGLRenderer_RenderFrame(SDL_Rect viewport) {
+     // Draw to canvas
+ 
+     glBindFramebuffer(GL_FRAMEBUFFER, canvas_fbo);
+-    glViewport(0, 0, 384, 224);
++    glViewport(0, 0, CANVAS_W, CANVAS_H);
+     glEnable(GL_DEPTH_TEST);
+     glDepthFunc(GL_LEQUAL);
+     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+diff --git a/src/platform/video/sdl_gpu/sdl_gpu_renderer.c b/src/platform/video/sdl_gpu/sdl_gpu_renderer.c
+index 658afed1..5aa45693 100644
+--- a/src/platform/video/sdl_gpu/sdl_gpu_renderer.c
++++ b/src/platform/video/sdl_gpu/sdl_gpu_renderer.c
+@@ -16,8 +16,14 @@
+ #include <libgraph.h>
+ 
+ #define QUADS_MAX 1024
+-#define CANVAS_WIDTH 384
+-#define CANVAS_HEIGHT 224
++// HD PROTOTYPE: internal render resolution multiplier. 1 = stock behaviour.
++// Vertices are converted straight to NDC (convert_to_screen_x/y divide by the
++// logical 384x224), so the canvas can be enlarged without touching game logic.
++#ifndef CANVAS_SCALE
++#define CANVAS_SCALE 4
++#endif
++#define CANVAS_WIDTH (384 * CANVAS_SCALE)
++#define CANVAS_HEIGHT (224 * CANVAS_SCALE)
+ #define CANVAS_TEXTURE_FORMAT SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM
+ 
+ typedef enum _PaletteType : Uint8 {
+diff --git a/src/sf33rd/AcrSDK/ps2/flps2vram.c b/src/sf33rd/AcrSDK/ps2/flps2vram.c
+index de5c9fbd..77528278 100644
+--- a/src/sf33rd/AcrSDK/ps2/flps2vram.c
++++ b/src/sf33rd/AcrSDK/ps2/flps2vram.c
+@@ -1044,6 +1044,32 @@ s32 flPS2ConvertTextureFromContext(plContext* lpcontext, FLTexture* lpflTexture,
+             tcon.pixelformat.rs = 0;
+             tcon.pixelformat.bs = 0x10;
+             flPS2ConvertContext(lpcontext, &tcon, 0, type);
++
++            /* Undo the GS alpha convention for the PC upload path.
++             *
++             * flPS2ConvertContext maps alpha 0xFF -> 0x80 and halves everything
++             * else, because on the real GS 0x80 means "fully opaque". Both PC
++             * renderers upload PSMCT32 straight as 8-bit-per-channel RGBA
++             * (GL_RGBA8 / SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM) and their
++             * fragment shaders use alpha as a plain 0..1 coverage against
++             * SRC_ALPHA/ONE_MINUS_SRC_ALPHA blending, so 0x80 draws an opaque
++             * texel at half coverage - the whole texture comes out at roughly
++             * 50% over the backdrop.
++             *
++             * No stock asset reaches here: every stock texture is PSMT4/PSMT8
++             * and its palette is PSMCT16 (bitdepth 2), which the halving above
++             * skips entirely. Only 32-bit chunks hit it, so this is dead code
++             * for an unmodified SF33RD.AFS.
++             */
++            {
++                u8* alpha = (u8*)tcon.ptr + 3;
++                s32 texels = tcon.width * tcon.height;
++                s32 i;
++
++                for (i = 0; i < texels; i++, alpha += 4) {
++                    *alpha = (*alpha >= 0x80) ? 0xFF : (u8)(*alpha * 2);
++                }
++            }
+             break;
+         }
+ 
+diff --git a/src/sf33rd/AcrSDK/ps2/foundaps2.c b/src/sf33rd/AcrSDK/ps2/foundaps2.c
+index 69284122..f557c175 100644
+--- a/src/sf33rd/AcrSDK/ps2/foundaps2.c
++++ b/src/sf33rd/AcrSDK/ps2/foundaps2.c
+@@ -25,6 +25,16 @@ FLTexture flPalette[FL_PALETTE_MAX];
+ s32 flWidth;
+ s32 flHeight;
+ u32 flSystemRenderOperation;
++#ifndef HD_MASTER_POOL
++#define HD_MASTER_POOL 0x20000000 // 512 MB (stock 0x1800000 = 24 MB); stage10.ppg is a 64 MB blob
++#endif
++#ifndef HD_TEXTURE_POOL
++// 384 MB (stock 0xA00000 = 10 MB). stage10 alone needs 160 MB; on top of that
++// the two HD player atlases hold ~36 MB and scrscrn.ppg stays resident from
++// Scrscreen_Init for ~23 MB once its chunks are 4x, so 256 MB left little room.
++#define HD_TEXTURE_POOL 0x18000000
++#endif
++
+ FL_FMS flFMS;
+ s32 flVramStaticNum;
+ 
+@@ -47,15 +57,18 @@ s32 flInitialize() {
+ static s32 system_work_init() {
+     void* temp;
+ 
++    // HD PROTOTYPE: PS2-sized budgets raised for high-resolution textures.
++    // Stock: master 0x1800000 (24 MB), system/texture pool 0xA00000 (10 MB).
++    // One 4x stage needs up to ~52 MB of texture pool alone (stage02).
+     SDL_zero(flPs2State);
+-    temp = malloc(0x1800000);
++    temp = malloc(HD_MASTER_POOL);
+ 
+     if (temp == NULL) {
+         return 0;
+     }
+ 
+-    fmsInitialize(&flFMS, temp, 0x1800000, 0x40);
+-    const int system_memory_size = 0xA00000;
++    fmsInitialize(&flFMS, temp, HD_MASTER_POOL, 0x40);
++    const int system_memory_size = HD_TEXTURE_POOL;
+     temp = flAllocMemoryS(system_memory_size);
+     mflInit(temp, system_memory_size, 0x40);
+ 
+diff --git a/src/sf33rd/Source/Common/PPGFile.c b/src/sf33rd/Source/Common/PPGFile.c
+index 18c8e88c..db912f32 100644
+--- a/src/sf33rd/Source/Common/PPGFile.c
++++ b/src/sf33rd/Source/Common/PPGFile.c
+@@ -10,6 +10,7 @@
+ #include "structs.h"
+ 
+ #include "core/renderer.h"
++#include "sf33rd/Source/Game/rendering/hd_atlas.h"
+ 
+ #include <SDL3/SDL.h>
+ 
+@@ -298,6 +299,25 @@ s32 ppgWriteQuadUseTrans(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix
+             ppgwf = ppg->width;
+             ppgw = ppg->width;
+             ppghf = ppg->height;
++            // HD indexed PPGs retain the original transfer table and palette
++            // banks. Only the stored texture dimensions grow; geometry and UV
++            // fractions use the original logical grid. formARGB is otherwise
++            // unused for indexed pixels. Stock files never use this marker.
++            const u16 hd_form = SDL_Swap16BE(ppg->formARGB);
++            const u16 hd_density = hd_form & 0xFF;
++            if ((ppg->pixel & 3) == 1 && (hd_form & 0xFF00) == 0x4800 &&
++                hd_density >= 2 && hd_density <= 4 &&
++                ppg->width % hd_density == 0 && ppg->height % hd_density == 0) {
++                ppgw /= hd_density;
++                ppgwf /= hd_density;
++                ppghf /= hd_density;
++                static bool hd_indexed_reported;
++                if (!hd_indexed_reported) {
++                    SDL_Log("HD indexed PPG: drawing %ux%u texture at %ux density with original palette banks",
++                            ppg->width * 16, ppg->height * 16, hd_density);
++                    hd_indexed_reported = true;
++                }
++            }
+             pxs = pos[3].x - pos[0].x;
+             pys = pos[3].y - pos[0].y;
+             sadd = 0.5f / pxs;
+@@ -746,119 +766,47 @@ error_handler:
+     flLogOut("ppgSetupTexChunkSeqs: Failed to acquire sprite texture handle");
+ }
+ 
+-void ppgRenewDotDataSeqs(Texture* tch, u32 gix, u32* srcRam, u32 code, u32 size) {
+-    s32 ix;
+-    s32 i;
+-    s32 j;
+-    u16* dstRam16;
+-    u16* srcRam16;
+-    u16* tix;
+-    u8* dstRam8;
+-    u8* srcRam8;
+-
+-    if (tch == NULL) {
+-        tch = ppg_w.cur->tex;
+-    }
+-
+-    if (tch->be != 0) {
+-        ix = gix - tch->ixNum1st;
+-
+-        if ((ix < 0) || (ix >= tch->total)) {
+-            return;
+-        }
+-
+-        if (tch->handle[ix].b16[0] != 0) {
+-            tch->handle[ix].b16[1] |= 0x2000;
+-
+-            switch (size) {
+-            case 0x40:
+-                srcRam8 = (u8*)srcRam;
+-                dstRam8 = (u8*)(tch->srcAdrs + tch->srcSize * ix + CODE_0(code));
+-
+-                for (i = 0; i < 8; i++) {
+-                    for (j = 0; j < 8; j++) {
+-                        *dstRam8++ = srcRam8[dctex_linear[j + (i << 5)]];
+-                    }
+-
+-                    dstRam8 += 0xF8;
+-                }
+-
+-                break;
+-
+-            case 0x100:
+-                srcRam8 = (u8*)srcRam;
+-                dstRam8 = (u8*)(tch->srcAdrs + tch->srcSize * ix + CODE_0(code));
+-
+-                for (i = 0; i < 0x10; i++) {
+-                    for (j = 0; j < 0x10; j++) {
+-                        *dstRam8++ = srcRam8[dctex_linear[j + (i << 5)]];
+-                    }
+-
+-                    dstRam8 += 0xF0;
+-                }
+-
+-                break;
+-
+-            case 0x400:
+-                srcRam8 = (u8*)srcRam;
+-                dstRam8 = (u8*)(tch->srcAdrs + tch->srcSize * ix + CODE_1(code));
+-                tix = (u16*)dctex_linear;
+-
+-                for (i = 0; i < 0x20; i++) {
+-                    for (j = 0; j < 0x20; j++) {
+-                        *dstRam8++ = srcRam8[*tix++];
+-                    }
+-
+-                    dstRam8 += 0xE0;
+-                }
+-
+-                break;
+-
+-            case 0x80:
+-                srcRam16 = (u16*)srcRam;
+-                dstRam16 = (u16*)(tch->srcAdrs + tch->srcSize * ix + (CODE_0(code)) * 2);
+-
+-                for (i = 0; i < 8; i++) {
+-                    for (j = 0; j < 8; j++) {
+-                        *dstRam16++ = srcRam16[dctex_linear[j + (i << 5)]];
+-                    }
+-
+-                    dstRam16 += 0xF8;
+-                }
+-
+-                break;
+-
+-            case 0x200:
+-                srcRam16 = (u16*)srcRam;
+-                dstRam16 = (u16*)(tch->srcAdrs + tch->srcSize * ix + (CODE_0(code)) * 2);
+-
+-                for (i = 0; i < 0x10; i++) {
+-                    for (j = 0; j < 0x10; j++) {
+-                        *dstRam16++ = srcRam16[dctex_linear[j + (i << 5)]];
+-                    }
+-
+-                    dstRam16 += 0xF0;
+-                }
+-
+-                break;
+-
+-            case 0x800:
+-                srcRam16 = (u16*)srcRam;
+-                dstRam16 = (u16*)(tch->srcAdrs + tch->srcSize * ix + (CODE_1(code)) * 2);
+-                tix = (u16*)dctex_linear;
+-
+-                for (i = 0; i < 0x20; i++) {
+-                    for (j = 0; j < 0x20; j++) {
+-                        *dstRam16++ = srcRam16[*tix++];
+-                    }
+-
+-                    dstRam16 += 0xE0;
+-                }
+-
+-                break;
+-            }
++void ppgRenewLinearDotDataSeqs(Texture* tch, u32 gix, const void* pixels, u32 slot,
++                               u32 side, u32 bpp, u32 density) {
++    if (!tch) tch = ppg_w.cur->tex;
++    if (!tch || !tch->be) return;
++    const s32 ix = gix - tch->ixNum1st;
++    if (ix < 0 || ix >= tch->total || !tch->handle[ix].b16[0]) return;
++    const FLTexture* texture = &flTexture[tch->handle[ix].b16[0] - 1];
++    const unsigned page_density = texture->width / 256;
++    if (texture->width != 256 * page_density || texture->height != texture->width ||
++        !hdAtlasCopy(tch->srcAdrs + tch->srcSize * ix, tch->srcSize,
++                     page_density, slot, side, bpp, pixels, density)) {
++        // Log once: a repeating per-tile message drowns the rest of the output.
++        static bool reported;
++        if (!reported) {
++            reported = true;
++            SDL_Log("HD CG: rejected atlas copy: page %ux%u, slot %u, side %u, bpp %u, source density %u",
++                    texture->width, texture->height, slot, side, bpp, density);
+         }
++        return;
+     }
++    tch->handle[ix].b16[1] |= 0x2000;
++}
++
++void ppgRenewDotDataSeqs(Texture* tch, u32 gix, u32* srcRam, u32 code, u32 size) {
++    unsigned side, bpp;
++    switch (size) {
++    case 0x40: side = 8; bpp = 1; break;
++    case 0x100: side = 16; bpp = 1; break;
++    case 0x400: side = 32; bpp = 1; break;
++    case 0x80: side = 8; bpp = 2; break;
++    case 0x200: side = 16; bpp = 2; break;
++    case 0x800: side = 32; bpp = 2; break;
++    default: return;
++    }
++    // Stock Morton domain remains 32x32, even when the destination is HD.
++    u8 linear[32 * 32 * 2];
++    for (unsigned y = 0; y < side; y++)
++        for (unsigned x = 0; x < side; x++)
++            SDL_memcpy(linear + (y * side + x) * bpp,
++                       (const u8*)srcRam + dctex_linear[x + y * 32] * bpp, bpp);
++    ppgRenewLinearDotDataSeqs(tch, gix, linear, code, side, bpp, 1);
+ }
+ 
+ void ppgMakeConvTableTexDC() {
+diff --git a/src/sf33rd/Source/Common/PPGFile.h b/src/sf33rd/Source/Common/PPGFile.h
+index 83f42405..03cd594c 100644
+--- a/src/sf33rd/Source/Common/PPGFile.h
++++ b/src/sf33rd/Source/Common/PPGFile.h
+@@ -32,3 +32,5 @@ s32 ppgSetupPalChunkDir(Palette* pch, PPLFileHeader* ppl, u8* adrs, s32 ixNum1st
+ s32 ppgCheckTextureDataBe(Texture* tch);
+ 
+ #endif // PPGFILE_H
++
++void ppgRenewLinearDotDataSeqs(Texture* tch, u32 gix, const void* pixels, u32 slot, u32 side, u32 bpp, u32 density);
+diff --git a/src/sf33rd/Source/Game/rendering/hd_atlas.h b/src/sf33rd/Source/Game/rendering/hd_atlas.h
+new file mode 100644
+index 00000000..140e562d
+--- /dev/null
++++ b/src/sf33rd/Source/Game/rendering/hd_atlas.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++// Logical slot class never depends on HD byte count. Source is linear, either
++// stock density or atlas density. All dimensions here are pixels, not bytes.
++static inline bool hdAtlasCopy(void* page, size_t page_bytes, unsigned density,
++                               unsigned slot, unsigned side, unsigned bpp,
++                               const void* pixels, unsigned source_density) {
++    if ((density != 1 && density != 2 && density != 4) ||
++        (source_density != 1 && source_density != density) ||
++        (side != 8 && side != 16 && side != 32) || (bpp != 1 && bpp != 2)) return false;
++    const unsigned columns = side == 32 ? 8 : 16;
++    const unsigned slot_side = side == 32 ? 32 : 16;
++    const unsigned width = 256 * density;
++    if (slot >= columns * columns || page_bytes != (size_t)width * width * bpp) return false;
++    const unsigned x0 = (slot % columns) * slot_side * density;
++    const unsigned y0 = (slot / columns) * slot_side * density;
++    const unsigned source_side = side * source_density;
++    for (unsigned y = 0; y < side * density; y++) {
++        uint8_t* dst = (uint8_t*)page + ((size_t)(y0 + y) * width + x0) * bpp;
++        const uint8_t* src = (const uint8_t*)pixels + (size_t)(y * source_density / density) * source_side * bpp;
++        if (source_density == density) memcpy(dst, src, source_side * bpp);
++        else for (unsigned x = 0; x < side * density; x++)
++            memcpy(dst + x * bpp, src + (x / density) * bpp, bpp);
++    }
++    return true;
++}
+diff --git a/src/sf33rd/Source/Game/rendering/hd_cg.c b/src/sf33rd/Source/Game/rendering/hd_cg.c
+new file mode 100644
+index 00000000..3ee28f0a
+--- /dev/null
++++ b/src/sf33rd/Source/Game/rendering/hd_cg.c
+@@ -0,0 +1,101 @@
++#include "sf33rd/Source/Game/rendering/hd_cg.h"
++#include "sf33rd/Source/Common/PPGFile.h"
++#include <SDL3/SDL.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define HD_GROUP_MAX 100
++#define HD_PACK_MAX (256 * 1024 * 1024)
++typedef struct { u8* data; unsigned scale, count, group; } HDPack;
++static HDPack packs[HD_GROUP_MAX];
++static bool initialized, any_hd;
++static bool reported[HD_GROUP_MAX];
++static unsigned read32(const u8* p) { return (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24); }
++
++static bool load_one(const char* path, unsigned expected_group) {
++    FILE* f = fopen(path, "rb");
++    if (!f) return false;
++    long length = -1;
++    if (fseek(f, 0, SEEK_END) == 0) length = ftell(f);
++    if (length < 24 || length > HD_PACK_MAX || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
++    u8* data = SDL_malloc((size_t)length);
++    if (!data) { fclose(f); return false; }
++    bool valid = fread(data, 1, (size_t)length, f) == (size_t)length;
++    fclose(f);
++    if (!valid || SDL_memcmp(data, "3SXCGHD1", 8) != 0) goto invalid;
++    unsigned density = read32(data + 8), group = read32(data + 12), count = read32(data + 16);
++    if ((density != 2 && density != 4) || group != expected_group || group >= HD_GROUP_MAX ||
++        count == 0 || count > 65536 || read32(data + 20) != (unsigned)length || 24 + count*12 > (unsigned)length) goto invalid;
++    unsigned offset = 24 + count*12;
++    for (unsigned i=0; i<count; i++) {
++        const u8* e = data + 24 + i*12;
++        unsigned wh=read32(e), off=read32(e+4), bytes=read32(e+8), side=((wh&3)+1)*8;
++        if (wh > 255 || (side != 8 && side != 16 && side != 32) || off != offset ||
++            bytes != side*side*density*density || off + bytes > (unsigned)length) goto invalid;
++        for (unsigned j=0; j<bytes; j++) if (data[off+j] >= 64) goto invalid;
++        offset += bytes;
++    }
++    if (offset != (unsigned)length) goto invalid;
++    packs[group] = (HDPack){data, density, count, group};
++    any_hd = true;
++    SDL_Log("HD CG: loaded group %u, %u tiles at %ux", group, count, density);
++    return true;
++invalid:
++    SDL_free(data);
++    return false;
++}
++
++static void load_pack(void) {
++    if (initialized) return;
++    initialized = true;
++    const char* path = SDL_getenv("THREESX_HD_CG");
++    if (!path || !*path) return;
++    /* THREESX_HD_CG names a directory of plNN.hdcg sidecars. Archive ids run
++       pl00-pl14 and pl16-pl20 (no pl15); texgroup ids are one higher below 16. */
++    char name[512];
++    for (unsigned group=1; group<=20; group++) {
++        unsigned archive_id = group >= 16 ? group : group - 1;
++        SDL_snprintf(name, sizeof(name), "%s/pl%02u.hdcg", path, archive_id);
++        if (!load_one(name, group)) SDL_Log("HD CG: no valid pack for group %u", group);
++    }
++    /* Player select objects. checkSelObjFileLoaded picks by language:
++       texgrpdat[98] = ef02.bin (Japanese), texgrpdat[23] = ef02_usa.bin. */
++    static const struct { const char* file; unsigned group; } objects[] = {
++        { "ef02.hdcg", 98 }, { "ef02_usa.hdcg", 23 },
++    };
++    for (unsigned i = 0; i < SDL_arraysize(objects); i++) {
++        SDL_snprintf(name, sizeof(name), "%s/%s", path, objects[i].file);
++        load_one(name, objects[i].group);
++    }
++}
++
++/* Caches that carry HD pages: the two player caches, plus cache 13 where the
++   player select objects draw (eff69.c:175). Anything else stays 1x. */
++int hdCgScaleForCache(int id) {
++    load_pack();
++    return (id == 3 || id == 4 || id == 13) && any_hd ? 4 : 1;
++}
++
++void hdCgUpload(MultiTexture* mt, unsigned group, unsigned tile, unsigned wh,
++                unsigned gix, const void* stock, unsigned slot, unsigned size,
++                const u16* palette) {
++    load_pack();
++    const HDPack* hd = group < HD_GROUP_MAX ? &packs[group] : NULL;
++    /* Only the player caches carry HD pages. The same character groups are also
++       uploaded into 1x caches (the opening's mlt_obj_melt2 uses cache 9), and
++       HD pixels do not fit those pages; those uploads stay stock. */
++    if (hd && hd->data && tile < hd->count && hdCgScaleForCache(mt->id) == (int)hd->scale) {
++        const u8* entry = hd->data + 24 + tile*12;
++        if (read32(entry) == wh) {
++            const u8* indices = hd->data + read32(entry+4);
++            unsigned side = ((wh&3)+1)*8;
++            if (!reported[group]) { SDL_Log("HD CG: drawing group %u in cache %d, %ux%u atlas", group, mt->id, 256*hd->scale, 256*hd->scale); reported[group]=true; }
++            if (palette) {
++                u16* rgb = SDL_malloc((size_t)side*side*hd->scale*hd->scale*sizeof(*rgb));
++                if (rgb) { for (unsigned j=0; j<side*side*hd->scale*hd->scale; j++) rgb[j]=palette[indices[j]];
++                    ppgRenewLinearDotDataSeqs(&mt->tex,gix,rgb,slot,side,2,hd->scale); SDL_free(rgb); return; }
++            } else { ppgRenewLinearDotDataSeqs(&mt->tex,gix,indices,slot,side,1,hd->scale); return; }
++        }
++    }
++    ppgRenewDotDataSeqs(&mt->tex, gix, (u32*)stock, slot, size);
++}
+diff --git a/src/sf33rd/Source/Game/rendering/hd_cg.h b/src/sf33rd/Source/Game/rendering/hd_cg.h
+new file mode 100644
+index 00000000..46106eaf
+--- /dev/null
++++ b/src/sf33rd/Source/Game/rendering/hd_cg.h
+@@ -0,0 +1,8 @@
++#pragma once
++#include "structs.h"
++
++// Optional local indexed HD pack. No pack means the original 1x path.
++int hdCgScaleForCache(int id);
++void hdCgUpload(MultiTexture* mt, unsigned group, unsigned tile, unsigned wh,
++                unsigned gix, const void* stock, unsigned slot, unsigned size,
++                const u16* palette);
+diff --git a/src/sf33rd/Source/Game/rendering/mtrans.c b/src/sf33rd/Source/Game/rendering/mtrans.c
+index 59c61b1f..8e8885da 100644
+--- a/src/sf33rd/Source/Game/rendering/mtrans.c
++++ b/src/sf33rd/Source/Game/rendering/mtrans.c
+@@ -18,6 +18,7 @@
+ #include "sf33rd/Source/Game/rendering/texgroup_data.h"
+ #include "sf33rd/Source/Game/system/work_sys.h"
+ #include "structs.h"
++#include "sf33rd/Source/Game/rendering/hd_cg.h"
+ 
+ #include "core/renderer.h"
+ 
+@@ -478,7 +479,7 @@ void mlt_obj_trans_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
+                 case 2:
+                     if (get_mltbuf16_ext_2(mt, cc.code, 0, &code, cp) != 0) {
+                         lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                        njReLoadTexturePartNumG(mt->mltgidx16 + (code >> 8), (s8*)mt->mltbuf, code & 0xFF, size);
++                        hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx16 + (code >> 8), mt->mltbuf, code & 0xFF, size, NULL);
+                     }
+ 
+                     rnum = seqsStoreChip(
+@@ -498,7 +499,7 @@ void mlt_obj_trans_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
+                 case 4:
+                     if (get_mltbuf32_ext_2(mt, cc.code, 0, &code, cp) != 0) {
+                         lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                        njReLoadTexturePartNumG(mt->mltgidx32 + (code >> 6), (s8*)mt->mltbuf, code & 0x3F, size);
++                        hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx32 + (code >> 6), mt->mltbuf, code & 0x3F, size, NULL);
+                     }
+ 
+                     rnum = seqsStoreChip(
+@@ -696,7 +697,7 @@ void mlt_obj_trans(MultiTexture* mt, WORK* wk, s32 base_y) {
+         case 2:
+             if (get_mltbuf16(mt, cc.code, 0, &code) != 0) {
+                 lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                njReLoadTexturePartNumG(mt->mltgidx16 + (code >> 8), (s8*)mt->mltbuf, code & 0xFF, size);
++                hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx16 + (code >> 8), mt->mltbuf, code & 0xFF, size, NULL);
+             }
+ 
+             rnum = seqsStoreChip(
+@@ -716,7 +717,7 @@ void mlt_obj_trans(MultiTexture* mt, WORK* wk, s32 base_y) {
+         case 4:
+             if (get_mltbuf32(mt, cc.code, 0, &code) != 0) {
+                 lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                njReLoadTexturePartNumG(mt->mltgidx32 + (code >> 6), (s8*)mt->mltbuf, code & 0x3F, size);
++                hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx32 + (code >> 6), mt->mltbuf, code & 0x3F, size, NULL);
+             }
+ 
+             rnum = seqsStoreChip(
+@@ -849,7 +850,7 @@ void mlt_obj_trans_cp3_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
+                 case 2:
+                     if (get_mltbuf16_ext_2(mt, cc.code, 0, &code, cp) != 0) {
+                         lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                        njReLoadTexturePartNumG(mt->mltgidx16 + (code >> 8), (s8*)mt->mltbuf, code & 0xFF, size);
++                        hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx16 + (code >> 8), mt->mltbuf, code & 0xFF, size, NULL);
+                     }
+ 
+                     rnum = seqsStoreChip(
+@@ -869,7 +870,7 @@ void mlt_obj_trans_cp3_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
+                 case 4:
+                     if (get_mltbuf32_ext_2(mt, cc.code, 0, &code, cp) != 0) {
+                         lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                        njReLoadTexturePartNumG(mt->mltgidx32 + (code >> 6), (s8*)mt->mltbuf, code & 0x3F, size);
++                        hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx32 + (code >> 6), mt->mltbuf, code & 0x3F, size, NULL);
+                     }
+ 
+                     rnum = seqsStoreChip(
+@@ -1078,7 +1079,7 @@ void mlt_obj_trans_cp3(MultiTexture* mt, WORK* wk, s32 base_y) {
+         case 2:
+             if (get_mltbuf16(mt, cc.code, 0, &code) != 0) {
+                 lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                njReLoadTexturePartNumG(mt->mltgidx16 + (code >> 8), (s8*)mt->mltbuf, code & 0xFF, size);
++                hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx16 + (code >> 8), mt->mltbuf, code & 0xFF, size, NULL);
+             }
+ 
+             rnum = seqsStoreChip(
+@@ -1098,7 +1099,7 @@ void mlt_obj_trans_cp3(MultiTexture* mt, WORK* wk, s32 base_y) {
+         case 4:
+             if (get_mltbuf32(mt, cc.code, 0, &code) != 0) {
+                 lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                njReLoadTexturePartNumG(mt->mltgidx32 + (code >> 6), (s8*)mt->mltbuf, code & 0x3F, size);
++                hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx32 + (code >> 6), mt->mltbuf, code & 0x3F, size, NULL);
+             }
+ 
+             rnum = seqsStoreChip(
+@@ -1230,7 +1231,7 @@ void mlt_obj_trans_rgb_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
+                 case 2:
+                     if (get_mltbuf16_ext_2(mt, cc.code, palt, &code, cp) != 0) {
+                         lz_ext_p6_cx(&((u8*)texptr)[1], (u16*)mt->mltbuf, size, (u16*)(ColorRAM[palt]));
+-                        njReLoadTexturePartNumG(mt->mltgidx16 + (code >> 8), (s8*)mt->mltbuf, code & 0xFF, size * 2);
++                        hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx16 + (code >> 8), mt->mltbuf, code & 0xFF, size * 2, (const u16*)ColorRAM[palt]);
+                     }
+ 
+                     rnum = seqsStoreChip(
+@@ -1249,7 +1250,7 @@ void mlt_obj_trans_rgb_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
+                 case 4:
+                     if (get_mltbuf32_ext_2(mt, cc.code, palt, &code, cp) != 0) {
+                         lz_ext_p6_cx(&((u8*)texptr)[1], (u16*)mt->mltbuf, size, (u16*)(ColorRAM[palt]));
+-                        njReLoadTexturePartNumG(mt->mltgidx32 + (code >> 6), (s8*)mt->mltbuf, code & 0x3F, size * 2);
++                        hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx32 + (code >> 6), mt->mltbuf, code & 0x3F, size * 2, (const u16*)ColorRAM[palt]);
+                     }
+ 
+                     rnum = seqsStoreChip(
+@@ -1452,7 +1453,7 @@ void mlt_obj_trans_rgb(MultiTexture* mt, WORK* wk, s32 base_y) {
+         case 2:
+             if (get_mltbuf16(mt, cc.code, palt, &code) != 0) {
+                 lz_ext_p6_cx(&((u8*)texptr)[1], (u16*)mt->mltbuf, size, (u16*)(ColorRAM[palt]));
+-                njReLoadTexturePartNumG(mt->mltgidx16 + (code >> 8), (s8*)mt->mltbuf, code & 0xFF, size * 2);
++                hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx16 + (code >> 8), mt->mltbuf, code & 0xFF, size * 2, (const u16*)ColorRAM[palt]);
+             }
+ 
+             rnum = seqsStoreChip(
+@@ -1471,7 +1472,7 @@ void mlt_obj_trans_rgb(MultiTexture* mt, WORK* wk, s32 base_y) {
+         case 4:
+             if (get_mltbuf32(mt, cc.code, palt, &code) != 0) {
+                 lz_ext_p6_cx(&((u8*)texptr)[1], (u16*)mt->mltbuf, size, (u16*)(ColorRAM[palt]));
+-                njReLoadTexturePartNumG(mt->mltgidx32 + (code >> 6), (s8*)mt->mltbuf, code & 0x3F, size * 2);
++                hdCgUpload(mt, i, trsptr->code, texptr->wh, mt->mltgidx32 + (code >> 6), mt->mltbuf, code & 0x3F, size * 2, (const u16*)ColorRAM[palt]);
+             }
+ 
+             rnum = seqsStoreChip(
+@@ -1625,6 +1626,11 @@ s32 seqsStoreChip(f32 x, f32 y, s32 w, s32 h, s32 gix, s32 code, s32 attr, s32 a
+         chip->tex_code = ppgGetUsingTextureHandle(NULL, gix + (code >> 6));
+     }
+ 
++    const f32 density = hdCgScaleForCache(id);
++    const f32 atlas_side = 256.0f * density;
++    const f32 tex_w = w * density, tex_h = h * density;
++    u *= density;
++    v *= density;
+     appRenewTempPriority_1_Chip();
+ 
+     const f32 screen_w = SDL_fabsf(chip->v[1].x - chip->v[0].x);
+@@ -1635,19 +1641,19 @@ s32 seqsStoreChip(f32 x, f32 y, s32 w, s32 h, s32 gix, s32 code, s32 attr, s32 a
+     const f32 uv_dy = scaled ? 0.5f : 0.0f;
+ 
+     if (attr & 0x8000) {
+-        chip->t[1].s = (u + uv_dx) / 256.0f;
+-        chip->t[0].s = (u + w - uv_dx) / 256.0f;
++        chip->t[1].s = (u + uv_dx) / atlas_side;
++        chip->t[0].s = (u + tex_w - uv_dx) / atlas_side;
+     } else {
+-        chip->t[0].s = (u + uv_dx) / 256.0f;
+-        chip->t[1].s = (u + w - uv_dx) / 256.0f;
++        chip->t[0].s = (u + uv_dx) / atlas_side;
++        chip->t[1].s = (u + tex_w - uv_dx) / atlas_side;
+     }
+ 
+     if (attr & 0x4000) {
+-        chip->t[1].t = (v + uv_dy) / 256.0f;
+-        chip->t[0].t = (v + h - uv_dy) / 256.0f;
++        chip->t[1].t = (v + uv_dy) / atlas_side;
++        chip->t[0].t = (v + tex_h - uv_dy) / atlas_side;
+     } else {
+-        chip->t[0].t = (v + uv_dy) / 256.0f;
+-        chip->t[1].t = (v + h - uv_dy) / 256.0f;
++        chip->t[0].t = (v + uv_dy) / atlas_side;
++        chip->t[1].t = (v + tex_h - uv_dy) / atlas_side;
+     }
+ 
+     chip->tex_code |= ppgGetUsingPaletteHandle(NULL, attr & 0x1FF) << 16;
+@@ -2037,7 +2043,7 @@ void mlt_obj_trans_init(MultiTexture* mt, s32 mode, u8* adrs) {
+     PPGFileHeader ppg;
+     s32 i;
+ 
+-    ppg.width = ppg.height = 16;
++    ppg.width = ppg.height = 16 * hdCgScaleForCache(mt->id);
+     ppg.compress = 0;
+     ppg.formARGB = 0x1555;
+     ppg.transNums = 0;
+@@ -2191,7 +2197,7 @@ void mlt_obj_melt2(MultiTexture* mt, u16 cg_number) {
+                 case 1:
+                 case 2:
+                     lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                    njReLoadTexturePartNumG(mt->mltgidx16 + (cd16 >> 8), (s8*)mt->mltbuf, cd16 & 0xFF, size);
++                    hdCgUpload(mt, obj_group_table[cg_number], trsptr->code, texptr->wh, mt->mltgidx16 + (cd16 >> 8), mt->mltbuf, cd16 & 0xFF, size, NULL);
+                     attr = (attr & 0xC000) | 0x1000 | dd;
+                     trsptr->attr |= 0x1000;
+                     attr |= palt;
+@@ -2203,7 +2209,7 @@ void mlt_obj_melt2(MultiTexture* mt, u16 cg_number) {
+ 
+                 case 4:
+                     lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+-                    njReLoadTexturePartNumG(mt->mltgidx32 + (cd32 >> 6), (s8*)mt->mltbuf, cd32 & 0x3F, size);
++                    hdCgUpload(mt, obj_group_table[cg_number], trsptr->code, texptr->wh, mt->mltgidx32 + (cd32 >> 6), mt->mltbuf, cd32 & 0x3F, size, NULL);
+                     attr = (attr & 0xC000) | 0x3000 | dd;
+                     trsptr->attr |= 0x1000;
+                     attr |= palt;
+diff --git a/src/sf33rd/Source/Game/rendering/texcash.c b/src/sf33rd/Source/Game/rendering/texcash.c
+index fbd1e93f..4ca41c74 100644
+--- a/src/sf33rd/Source/Game/rendering/texcash.c
++++ b/src/sf33rd/Source/Game/rendering/texcash.c
+@@ -14,6 +14,7 @@
+ #include "sf33rd/Source/Game/system/ramcnt.h"
+ #include "sf33rd/Source/Game/system/sys_sub.h"
+ #include "structs.h"
++#include "sf33rd/Source/Game/rendering/hd_cg.h"
+ 
+ #include <SDL3/SDL.h>
+ 
+@@ -296,6 +297,9 @@ void make_texcash_work(s16 ix) {
+         mts[ix].mltbuf = texcash_melt_buffer;
+         memreq = ((mts_base[ix].mode & 4) != 0) + 1;
+         memreq *= (mts[ix].mltnum << 0x10);
++        const int density = hdCgScaleForCache(ix);
++        memreq *= density * density;
++        mts[ix].id = ix;
+         mts_ok[ix].key1 = Pull_ramcnt_key(memreq, mts_base[ix].type, 0, 0);
+         mts[ix].attribute = mts_base[ix].attribute;
+         mlt_obj_trans_init(&mts[ix], mts_base[ix].mode, Get_ramcnt_pointer(mts_ok[ix].key1));

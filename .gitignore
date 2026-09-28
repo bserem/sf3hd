@@ -1,0 +1,15 @@
+# Never commit the user-supplied original asset container.
+SF33RD.AFS
+*.AFS
+*.afs
+
+# All extracted / converted / derived asset data stays local-only.
+work/
+output/
+texture-pack/
+
+# The upstream 3sx checkout is a separate repo.
+3sx/
+
+__pycache__/
+*.pyc
