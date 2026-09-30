@@ -45,11 +45,11 @@ assume it does.
 |---|---|
 | **Your own `SF33RD.AFS`** | 642,492,416 bytes for the common release. Other regions may work; the tools read the archive's own index rather than assuming offsets. |
 | **A 3SX checkout** | `git clone https://github.com/crowded-street/3sx.git 3sx` |
-| **A Vulkan-capable GPU** | Both for the upscaler and for 3SX. An integrated GPU is fine — the full character run took about 11 minutes on an Intel 890M. |
+| **A Vulkan-capable GPU** | Both for the upscaler and for 3SX. An integrated GPU is fine — the full character run took about 11 minutes on an Radeon 890M. |
 | **Disk space** | About **18 GB** under `work/`: 5.2 GB of upscaled PNGs, 4.9 GB of cut tiles, 2.4 GB of character sidecars, and a 3.5 GB bundle holding a second copy of the sidecars plus the rebuilt 1.2 GB archive. You can delete `work/upscaled` and `work/for_upscale` once `work/tiles` is built. |
 | **RAM** | 8 GB to run the pipeline. **Roughly 3 GB while playing** — see [Memory](#memory-and-performance). |
 
-Times below are from a Ryzen laptop with an Intel 890M iGPU. Yours will differ.
+Times below are from a Ryzen 390 HX laptop with an Radeon 890M iGPU. Yours will differ.
 
 ---
 
